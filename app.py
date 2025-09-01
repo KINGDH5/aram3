@@ -1,4 +1,4 @@
-# app.py — ARAM 챔피언 대시보드 (+ 아이템 0/포로 간식 전처리, 스펠 무순서 집계, 룬 아이콘 나열 섹션)
+# app.py — ARAM 챔피언 대시보드 (+ 아이템 0 전처리, 스펠 무순서 집계)
 import os, re, json
 import pandas as pd
 import streamlit as st
@@ -9,7 +9,7 @@ st.set_page_config(page_title="ARAM PS Dashboard", layout="wide")
 PLAYERS_CSV   = "aram_participants_with_icons_superlight.csv"  # 참가자 행 데이터
 ITEM_SUM_CSV  = "item_summary_with_icons.csv"                  # item, icon_url, total_picks, wins, win_rate
 CHAMP_CSV     = "champion_icons.csv"                           # champion, champion_icon (또는 icon/icon_url)
-RUNE_CSV      = "rune_icons.csv"                               # (A) type,name,icon_url  또는 (B) 기존 매핑 스키마
+RUNE_CSV      = "rune_icons.csv"                               # (A) type,name,icon_url 또는 (B) 구 매핑 스키마
 SPELL_CSV     = "spell_icons.csv"                              # 스펠 이름 ↔ 아이콘 URL
 DD_VERSION    = "15.16.1"                                      # Data Dragon 폴백 버전
 
@@ -79,10 +79,10 @@ def load_rune_icons(path: str) -> dict:
     두 스키마 모두 지원:
     (A) 아이콘-나열형:  type,name,icon_url
     (B) 구 매핑형:      rune_core,rune_core_icon,rune_sub,rune_sub_icon,(선택)rune_shard,rune_shard_icon
-    return: {"core":{name:icon}, "sub":{name:icon}, "shards":{name:icon}, "raw_df":DataFrame or None}
+    return: {"core":{name:icon}, "sub":{name:icon}, "shards":{name:icon}}
     """
     if not _exists(path):
-        return {"core": {}, "sub": {}, "shards": {}, "raw_df": None}
+        return {"core": {}, "sub": {}, "shards": {}}
     df = pd.read_csv(path)
 
     core_map, sub_map, shard_map = {}, {}, {}
@@ -91,7 +91,7 @@ def load_rune_icons(path: str) -> dict:
         core_map  = dict(df[df["type"]=="core"][["name","icon_url"]].values)
         sub_map   = dict(df[df["type"]=="sub"][["name","icon_url"]].values)
         shard_map = dict(df[df["type"]=="shard"][["name","icon_url"]].values)
-        return {"core": core_map, "sub": sub_map, "shards": shard_map, "raw_df": df}
+        return {"core": core_map, "sub": sub_map, "shards": shard_map}
 
     # (B) 구 스키마(하위 호환)
     if "rune_core" in df.columns:
@@ -103,8 +103,7 @@ def load_rune_icons(path: str) -> dict:
     if "rune_shard" in df.columns:
         ic = "rune_shard_icon" if "rune_shard_icon" in df.columns else ("rune_shards_icons" if "rune_shards_icons" in df.columns else None)
         if ic: shard_map = dict(zip(df["rune_shard"].astype(str), df[ic].astype(str)))
-
-    return {"core": core_map, "sub": sub_map, "shards": shard_map, "raw_df": None}
+    return {"core": core_map, "sub": sub_map, "shards": shard_map}
 
 @st.cache_data
 def load_spell_icons(path: str) -> dict:
@@ -131,7 +130,7 @@ def load_spell_icons(path: str) -> dict:
 df        = load_players(PLAYERS_CSV)
 item_sum  = load_item_summary(ITEM_SUM_CSV)
 champ_map = load_champion_icons(CHAMP_CSV)
-rune_maps = load_rune_icons(RUNE_CSV)  # <-- 개선된 로더 (아이콘 나열도 지원)
+rune_maps = load_rune_icons(RUNE_CSV)
 spell_map = load_spell_icons(SPELL_CSV)
 
 ITEM_ICON_MAP = dict(zip(item_sum.get("item", []), item_sum.get("icon_url", [])))
@@ -170,7 +169,7 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
         stacks.append(dsel[[c, "win_clean"]].rename(columns={c: "item"}))
     union = pd.concat(stacks, ignore_index=True)
     union["item"] = union["item"].astype(str).str.strip()
-    union = union[~union["item"].isin(["", "0", "포로 간식"])]
+    union = union[~union["item"].isin(["", "0", "포로 간식"])]   # 0/포로간식 제외
 
     top_items = (
         union.groupby("item", as_index=False)
@@ -241,13 +240,12 @@ def canonical_pair(a: str, b: str):
     b_std = standard_korean_spell(b or "")
     a_key, b_key = _norm(a_std), _norm(b_std)
     if (a_key, b_key) <= (b_key, a_key):
-        return a_std, b_std   # 이미 정렬
+        return a_std, b_std
     else:
-        return b_std, a_std   # 교환
+        return b_std, a_std
 
 s1, s2 = pick_spell_cols(dsel)
 if games and s1 and s2:
-    # 정규화된 무순서 키로 집계
     tmp = dsel[[s1, s2, "win_clean"]].copy()
     tmp["s1_std"], tmp["s2_std"] = zip(*tmp.apply(lambda r: canonical_pair(r[s1], r[s2]), axis=1))
     sp = (
@@ -272,68 +270,87 @@ if games and s1 and s2:
 else:
     st.info("스펠 컬럼을 찾지 못했습니다. (spell1_name_fix/spell2_name_fix 또는 spell1/spell2 필요)")
 
-# ===== 룬 추천(통계) =====
-st.subheader("Recommended Rune Combos")
-core_map = rune_maps.get("core", {})
-sub_map  = rune_maps.get("sub", {})
+# ===== 👇 여기부터: 룬 UI만 교체 (u.gg 느낌의 아이콘 보드) =====
+st.subheader("룬 (조합 보드)")
 
-def _rune_core_icon(name: str) -> str: return core_map.get(name, "")
-def _rune_sub_icon(name: str)  -> str: return sub_map.get(name, "")
+core_map = load_rune_icons(RUNE_CSV)["core"]
+sub_map  = load_rune_icons(RUNE_CSV)["sub"]
+shard_map= load_rune_icons(RUNE_CSV)["shards"]
+
+# 파편 컬럼 자동 감지 (있으면 3개까지 사용)
+shard_cols = [c for c in dsel.columns if c.lower().startswith("shard")]
+if len(shard_cols) > 3:
+    shard_cols = shard_cols[:3]
 
 if games and {"rune_core","rune_sub"}.issubset(dsel.columns):
-    ru = (
-        dsel.groupby(["rune_core","rune_sub"])
-        .agg(games=("win_clean","count"), wins=("win_clean","sum"))
-        .reset_index()
-    )
-    ru["win_rate"] = (ru["wins"]/ru["games"]*100).round(2)
-    ru = ru.sort_values(["games","win_rate"], ascending=[False,False]).head(10)
-    ru["rune_core_icon"] = ru["rune_core"].apply(_rune_core_icon)
-    ru["rune_sub_icon"]  = ru["rune_sub"].apply(_rune_sub_icon)
+    base_games = len(dsel)
+    g = (dsel.groupby(["rune_core","rune_sub"], as_index=False)
+            .agg(games=("win_clean","count"), wins=("win_clean","sum")))
+    g["win_rate"]  = (g["wins"]/g["games"]*100).round(2)
+    g["pick_rate"] = (g["games"]/base_games*100).round(2)
+    g = g.sort_values(["games","win_rate"], ascending=[False,False]).head(10)
 
-    st.dataframe(
-        ru[["rune_core_icon","rune_core","rune_sub_icon","rune_sub","games","wins","win_rate"]],
-        use_container_width=True,
-        column_config={
-            "rune_core_icon": st.column_config.ImageColumn("핵심룬", width="small"),
-            "rune_sub_icon":  st.column_config.ImageColumn("보조트리", width="small"),
-            "rune_core":"핵심룬 이름","rune_sub":"보조트리 이름",
-            "games":"게임수","wins":"승수","win_rate":"승률(%)"
-        }
-    )
+    # 가장 흔한 파편조합 1개(있을 때만)
+    if shard_cols:
+        shard_top = (dsel.groupby(shard_cols).size().reset_index(name="cnt")
+                          .sort_values("cnt", ascending=False).head(1))
+        shard_tuple = tuple(shard_top.iloc[0][shard_cols].astype(str)) if not shard_top.empty else tuple()
+    else:
+        shard_tuple = tuple()
+
+    # 스타일
+    st.markdown("""
+    <style>
+    .rboard { width:100%; border-radius:10px; padding:6px 10px; background:rgba(0,0,0,.02);}
+    .rrow { display:flex; align-items:center; justify-content:space-between;
+            padding:8px 10px; border-bottom:1px solid rgba(0,0,0,.06);}
+    .rrow:last-child{ border-bottom:none; }
+    .icons { display:flex; align-items:center; gap:10px; }
+    .ico.big{ width:40px; height:40px; border-radius:8px; }
+    .ico.sub{ width:34px; height:34px; border-radius:8px; opacity:.95;}
+    .ico.shard{ width:24px; height:24px; border-radius:6px; opacity:.95;}
+    .nums { min-width:260px; text-align:right; font-weight:600; display:flex; gap:18px; justify-content:flex-end; }
+    .nums span { min-width:72px; display:inline-block; }
+    .w { color:#0A7F3F; }   /* 승률 */
+    .p { color:#39424e; }   /* 채택률 */
+    .g { color:#687385; }   /* 게임수 */
+    </style>
+    """, unsafe_allow_html=True)
+
+    # 행 렌더
+    html = ['<div class="rboard">']
+    for _, r in g.iterrows():
+        core, sub = str(r["rune_core"]), str(r["rune_sub"])
+        core_icon = core_map.get(core, "")
+        sub_icon  = sub_map.get(sub, "")
+
+        shard_imgs = ""
+        if shard_tuple and shard_map:
+            for s in shard_tuple:
+                url = shard_map.get(str(s), "")
+                if url:
+                    shard_imgs += f'<img class="ico shard" src="{url}"/>'
+
+        icons_block = f"""
+          <div class="icons">
+            {'<img class="ico big" src="'+core_icon+'"/>' if core_icon else ''}
+            {'<img class="ico sub" src="'+sub_icon+'"/>' if sub_icon else ''}
+            {shard_imgs}
+          </div>
+        """
+        nums_block = f"""
+          <div class="nums">
+            <span class="w">{r['win_rate']:.2f}%</span>
+            <span class="p">{r['pick_rate']:.2f}%</span>
+            <span class="g">{int(r['games'])}</span>
+          </div>
+        """
+        html.append(f'<div class="rrow">{icons_block}{nums_block}</div>')
+    html.append('</div>')
+    st.markdown("\n".join(html), unsafe_allow_html=True)
 else:
-    st.info("룬 컬럼(rune_core, rune_sub)이 없습니다.")
-
-# ===== 룬 아이콘 갤러리 (아이콘만 나열) =====
-st.subheader("룬 아이콘 나열 (샘플)")
-icon_df = rune_maps.get("raw_df", None)
-
-def _gallery_row(df_part: pd.DataFrame, per_row: int = 8, img_w: int = 44):
-    if df_part is None or df_part.empty:
-        st.info("아이콘 CSV에 type,name,icon_url 스키마가 없어서 나열을 건너뜁니다.")
-        return
-    # 여러 줄로 깔끔하게 배치
-    parts = [df_part.iloc[i:i+per_row] for i in range(0, len(df_part), per_row)]
-    for block in parts:
-        cols = st.columns(len(block))
-        for c, (_, r) in zip(cols, block.iterrows()):
-            with c:
-                if isinstance(r.get("icon_url", ""), str) and r["icon_url"]:
-                    st.image(r["icon_url"], width=img_w)
-                st.caption(str(r.get("name","")).strip() or " ")
-        st.write("")  # 줄 간격
-
-if icon_df is not None and {"type","name","icon_url"}.issubset(icon_df.columns):
-    st.markdown("**핵심룬(Keystones)**")
-    _gallery_row(icon_df[icon_df["type"]=="core"], per_row=10, img_w=48)
-
-    st.markdown("**보조트리**")
-    _gallery_row(icon_df[icon_df["type"]=="sub"], per_row=10, img_w=46)
-
-    st.markdown("**파편(Stat Shards)**")
-    _gallery_row(icon_df[icon_df["type"]=="shard"], per_row=12, img_w=36)
-else:
-    st.caption("참고: `rune_icons.csv`를 type,name,icon_url 스키마로 만들면 위에 아이콘들이 쭉 나열됩니다.")
+    st.info("룬 컬럼(rune_core, rune_sub)이 없어 보드를 만들 수 없습니다.")
+# ===== 👆 룬 UI 변경 끝 =====
 
 # ===== (선택) 한 패널: 5v5 평균 승률 vs 평균 승률 + GPT 전략 =====
 st.header("5v5 평균 승률 비교 & 전략 (단일 패널)")
