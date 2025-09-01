@@ -1,4 +1,4 @@
-# app.py — ARAM 챔피언 대시보드 (+ 아이템 0 전처리, 스펠 무순서 집계)
+# app.py — ARAM 챔피언 대시보드 (+ 아이템 0/포로 간식 전처리, 스펠 무순서 집계, 룬 아이콘 나열 섹션)
 import os, re, json
 import pandas as pd
 import streamlit as st
@@ -9,7 +9,7 @@ st.set_page_config(page_title="ARAM PS Dashboard", layout="wide")
 PLAYERS_CSV   = "aram_participants_with_icons_superlight.csv"  # 참가자 행 데이터
 ITEM_SUM_CSV  = "item_summary_with_icons.csv"                  # item, icon_url, total_picks, wins, win_rate
 CHAMP_CSV     = "champion_icons.csv"                           # champion, champion_icon (또는 icon/icon_url)
-RUNE_CSV      = "rune_icons.csv"                               # rune_core, rune_core_icon, rune_sub, rune_sub_icon
+RUNE_CSV      = "rune_icons.csv"                               # (A) type,name,icon_url  또는 (B) 기존 매핑 스키마
 SPELL_CSV     = "spell_icons.csv"                              # 스펠 이름 ↔ 아이콘 URL
 DD_VERSION    = "15.16.1"                                      # Data Dragon 폴백 버전
 
@@ -75,10 +75,25 @@ def load_champion_icons(path: str) -> dict:
 
 @st.cache_data
 def load_rune_icons(path: str) -> dict:
+    """
+    두 스키마 모두 지원:
+    (A) 아이콘-나열형:  type,name,icon_url
+    (B) 구 매핑형:      rune_core,rune_core_icon,rune_sub,rune_sub_icon,(선택)rune_shard,rune_shard_icon
+    return: {"core":{name:icon}, "sub":{name:icon}, "shards":{name:icon}, "raw_df":DataFrame or None}
+    """
     if not _exists(path):
-        return {"core": {}, "sub": {}, "shards": {}}
+        return {"core": {}, "sub": {}, "shards": {}, "raw_df": None}
     df = pd.read_csv(path)
+
     core_map, sub_map, shard_map = {}, {}, {}
+    # (A) 새 스키마
+    if {"type","name","icon_url"}.issubset(df.columns):
+        core_map  = dict(df[df["type"]=="core"][["name","icon_url"]].values)
+        sub_map   = dict(df[df["type"]=="sub"][["name","icon_url"]].values)
+        shard_map = dict(df[df["type"]=="shard"][["name","icon_url"]].values)
+        return {"core": core_map, "sub": sub_map, "shards": shard_map, "raw_df": df}
+
+    # (B) 구 스키마(하위 호환)
     if "rune_core" in df.columns:
         ic = "rune_core_icon" if "rune_core_icon" in df.columns else None
         if ic: core_map = dict(zip(df["rune_core"].astype(str), df[ic].astype(str)))
@@ -88,7 +103,8 @@ def load_rune_icons(path: str) -> dict:
     if "rune_shard" in df.columns:
         ic = "rune_shard_icon" if "rune_shard_icon" in df.columns else ("rune_shards_icons" if "rune_shards_icons" in df.columns else None)
         if ic: shard_map = dict(zip(df["rune_shard"].astype(str), df[ic].astype(str)))
-    return {"core": core_map, "sub": sub_map, "shards": shard_map}
+
+    return {"core": core_map, "sub": sub_map, "shards": shard_map, "raw_df": None}
 
 @st.cache_data
 def load_spell_icons(path: str) -> dict:
@@ -115,7 +131,7 @@ def load_spell_icons(path: str) -> dict:
 df        = load_players(PLAYERS_CSV)
 item_sum  = load_item_summary(ITEM_SUM_CSV)
 champ_map = load_champion_icons(CHAMP_CSV)
-rune_maps = load_rune_icons(RUNE_CSV)
+rune_maps = load_rune_icons(RUNE_CSV)  # <-- 개선된 로더 (아이콘 나열도 지원)
 spell_map = load_spell_icons(SPELL_CSV)
 
 ITEM_ICON_MAP = dict(zip(item_sum.get("item", []), item_sum.get("icon_url", [])))
@@ -154,7 +170,7 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
         stacks.append(dsel[[c, "win_clean"]].rename(columns={c: "item"}))
     union = pd.concat(stacks, ignore_index=True)
     union["item"] = union["item"].astype(str).str.strip()
-    union = union[~union["item"].isin(["", "0", "포로 간식"])]   # ← 여기 들여쓰기 맞춤
+    union = union[~union["item"].isin(["", "0", "포로 간식"])]
 
     top_items = (
         union.groupby("item", as_index=False)
@@ -179,7 +195,6 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
     )
 else:
     st.info("아이템 이름 컬럼(item0_name~item6_name)이 없어 챔피언별 아이템 집계를 만들 수 없습니다.")
-
 
 # ===== 스펠 추천 (무순서 집계) =====
 st.subheader("Recommended Spell Combos (순서 무시)")
@@ -257,7 +272,7 @@ if games and s1 and s2:
 else:
     st.info("스펠 컬럼을 찾지 못했습니다. (spell1_name_fix/spell2_name_fix 또는 spell1/spell2 필요)")
 
-# ===== 룬 추천 =====
+# ===== 룬 추천(통계) =====
 st.subheader("Recommended Rune Combos")
 core_map = rune_maps.get("core", {})
 sub_map  = rune_maps.get("sub", {})
@@ -288,6 +303,37 @@ if games and {"rune_core","rune_sub"}.issubset(dsel.columns):
     )
 else:
     st.info("룬 컬럼(rune_core, rune_sub)이 없습니다.")
+
+# ===== 룬 아이콘 갤러리 (아이콘만 나열) =====
+st.subheader("룬 아이콘 나열 (샘플)")
+icon_df = rune_maps.get("raw_df", None)
+
+def _gallery_row(df_part: pd.DataFrame, per_row: int = 8, img_w: int = 44):
+    if df_part is None or df_part.empty:
+        st.info("아이콘 CSV에 type,name,icon_url 스키마가 없어서 나열을 건너뜁니다.")
+        return
+    # 여러 줄로 깔끔하게 배치
+    parts = [df_part.iloc[i:i+per_row] for i in range(0, len(df_part), per_row)]
+    for block in parts:
+        cols = st.columns(len(block))
+        for c, (_, r) in zip(cols, block.iterrows()):
+            with c:
+                if isinstance(r.get("icon_url", ""), str) and r["icon_url"]:
+                    st.image(r["icon_url"], width=img_w)
+                st.caption(str(r.get("name","")).strip() or " ")
+        st.write("")  # 줄 간격
+
+if icon_df is not None and {"type","name","icon_url"}.issubset(icon_df.columns):
+    st.markdown("**핵심룬(Keystones)**")
+    _gallery_row(icon_df[icon_df["type"]=="core"], per_row=10, img_w=48)
+
+    st.markdown("**보조트리**")
+    _gallery_row(icon_df[icon_df["type"]=="sub"], per_row=10, img_w=46)
+
+    st.markdown("**파편(Stat Shards)**")
+    _gallery_row(icon_df[icon_df["type"]=="shard"], per_row=12, img_w=36)
+else:
+    st.caption("참고: `rune_icons.csv`를 type,name,icon_url 스키마로 만들면 위에 아이콘들이 쭉 나열됩니다.")
 
 # ===== (선택) 한 패널: 5v5 평균 승률 vs 평균 승률 + GPT 전략 =====
 st.header("5v5 평균 승률 비교 & 전략 (단일 패널)")
