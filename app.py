@@ -1,4 +1,4 @@
-# app.py — ARAM 챔피언 대시보드 (+ 한 패널: 5v5 평균 승률 & GPT 전략)
+# app.py — ARAM 챔피언 대시보드 (+ 아이템 0 전처리, 스펠 무순서 집계)
 import os, re, json
 import pandas as pd
 import streamlit as st
@@ -10,9 +10,8 @@ PLAYERS_CSV   = "aram_participants_with_icons_superlight.csv"  # 참가자 행 �
 ITEM_SUM_CSV  = "item_summary_with_icons.csv"                  # item, icon_url, total_picks, wins, win_rate
 CHAMP_CSV     = "champion_icons.csv"                           # champion, champion_icon (또는 icon/icon_url)
 RUNE_CSV      = "rune_icons.csv"                               # rune_core, rune_core_icon, rune_sub, rune_sub_icon
-SPELL_CSV     = "spell_icons.csv"                              # 스펠이름, 아이콘URL (헤더 자유)
-
-DD_VERSION = "15.16.1"  # Data Dragon 폴백 버전 (필요시 최신으로 교체)
+SPELL_CSV     = "spell_icons.csv"                              # 스펠 이름 ↔ 아이콘 URL
+DD_VERSION    = "15.16.1"                                      # Data Dragon 폴백 버전
 
 # ===== 유틸 =====
 def _exists(path: str) -> bool:
@@ -38,9 +37,10 @@ def load_players(path: str) -> pd.DataFrame:
         else:
             df["win_clean"] = 0
 
-    # 아이템 이름 정리
+    # 아이템 이름 정리 + "0" 전처리 (아이템 구매 전 종료 케이스 제외)
     for c in [c for c in df.columns if re.fullmatch(r"item[0-6]_name", c)]:
         df[c] = df[c].fillna("").astype(str).str.strip()
+        df[c] = df[c].replace({"0": "", 0: ""})
 
     # 기본 텍스트 컬럼
     for c in ["spell1","spell2","spell1_name_fix","spell2_name_fix","rune_core","rune_sub","champion","matchId"]:
@@ -58,6 +58,7 @@ def load_item_summary(path: str) -> pd.DataFrame:
         st.warning(f"`{path}` 헤더 확인 필요 (기대: {sorted(need)}, 실제: {list(g.columns)})")
     if "item" in g.columns:
         g = g[g["item"].astype(str).str.strip() != ""]
+        g = g[g["item"] != "0"]  # 혹시 요약 파일에도 0이 남아있다면 제거
     return g
 
 @st.cache_data
@@ -65,14 +66,8 @@ def load_champion_icons(path: str) -> dict:
     if not _exists(path):
         return {}
     df = pd.read_csv(path)
-    name_col = None
-    for c in ["champion","Champion","championName"]:
-        if c in df.columns:
-            name_col = c; break
-    icon_col = None
-    for c in ["champion_icon","icon","icon_url"]:
-        if c in df.columns:
-            icon_col = c; break
+    name_col = next((c for c in ["champion","Champion","championName"] if c in df.columns), None)
+    icon_col = next((c for c in ["champion_icon","icon","icon_url"] if c in df.columns), None)
     if not name_col or not icon_col:
         return {}
     df[name_col] = df[name_col].astype(str).str.strip()
@@ -159,6 +154,8 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
         stacks.append(dsel[[c, "win_clean"]].rename(columns={c: "item"}))
     union = pd.concat(stacks, ignore_index=True)
     union = union[union["item"].astype(str).str.strip() != ""]
+    union = union[union["item"] != "0"]  # 안전망
+
     top_items = (
         union.groupby("item")
         .agg(total_picks=("item","count"), wins=("win_clean","sum"))
@@ -179,8 +176,9 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
 else:
     st.info("아이템 이름 컬럼(item0_name~item6_name)이 없어 챔피언별 아이템 집계를 만들 수 없습니다.")
 
-# ===== 스펠 추천 =====
-st.subheader("Recommended Spell Combos")
+# ===== 스펠 추천 (무순서 집계) =====
+st.subheader("Recommended Spell Combos (순서 무시)")
+
 SPELL_ALIASES = {
     "점멸":"점멸","표식":"표식","눈덩이":"표식","유체화":"유체화","회복":"회복","점화":"점화",
     "정화":"정화","탈진":"탈진","방어막":"방어막","총명":"총명","순간이동":"순간이동",
@@ -217,25 +215,37 @@ def pick_spell_cols(df_):
     cands = [c for c in df_.columns if "spell" in c.lower()]
     return (cands[0], cands[1]) if len(cands) >= 2 else (None, None)
 
+def canonical_pair(a: str, b: str):
+    """스펠 조합을 순서 무시하고 동일 키로 묶기 위해 정규화 + 사전식 정렬"""
+    a_std = standard_korean_spell(a or "")
+    b_std = standard_korean_spell(b or "")
+    a_key, b_key = _norm(a_std), _norm(b_std)
+    if (a_key, b_key) <= (b_key, a_key):
+        return a_std, b_std   # 이미 정렬
+    else:
+        return b_std, a_std   # 교환
+
 s1, s2 = pick_spell_cols(dsel)
 if games and s1 and s2:
+    # 정규화된 무순서 키로 집계
+    tmp = dsel[[s1, s2, "win_clean"]].copy()
+    tmp["s1_std"], tmp["s2_std"] = zip(*tmp.apply(lambda r: canonical_pair(r[s1], r[s2]), axis=1))
     sp = (
-        dsel.groupby([s1, s2])
-        .agg(games=("win_clean","count"), wins=("win_clean","sum"))
-        .reset_index()
+        tmp.groupby(["s1_std","s2_std"], as_index=False)
+           .agg(games=("win_clean","count"), wins=("win_clean","sum"))
     )
     sp["win_rate"] = (sp["wins"]/sp["games"]*100).round(2)
     sp = sp.sort_values(["games","win_rate"], ascending=[False,False]).head(10)
-    sp["spell1_icon"] = sp[s1].apply(resolve_spell_icon)
-    sp["spell2_icon"] = sp[s2].apply(resolve_spell_icon)
+    sp["spell1_icon"] = sp["s1_std"].apply(resolve_spell_icon)
+    sp["spell2_icon"] = sp["s2_std"].apply(resolve_spell_icon)
 
     st.dataframe(
-        sp[["spell1_icon", s1, "spell2_icon", s2, "games", "wins", "win_rate"]],
+        sp[["spell1_icon","s1_std","spell2_icon","s2_std","games","wins","win_rate"]],
         use_container_width=True,
         column_config={
             "spell1_icon": st.column_config.ImageColumn("스펠1", width="small"),
             "spell2_icon": st.column_config.ImageColumn("스펠2", width="small"),
-            s1: "스펠1 이름", s2: "스펠2 이름",
+            "s1_std": "스펠1 이름", "s2_std": "스펠2 이름",
             "games":"게임수","wins":"승수","win_rate":"승률(%)"
         }
     )
@@ -274,7 +284,7 @@ if games and {"rune_core","rune_sub"}.issubset(dsel.columns):
 else:
     st.info("룬 컬럼(rune_core, rune_sub)이 없습니다.")
 
-# ===== (신규) 한 패널: 5v5 평균 승률 vs 평균 승률 + GPT 전략 =====
+# ===== (선택) 한 패널: 5v5 평균 승률 vs 평균 승률 + GPT 전략 =====
 st.header("5v5 평균 승률 비교 & 전략 (단일 패널)")
 with st.container():
     st.markdown(
@@ -282,10 +292,9 @@ with st.container():
         "- 모델 학습 전이므로 **챔피언별 베이스라인 승률의 단순 평균**을 비교합니다."
     )
 
-    # 1) 챔피언별 베이스라인 승률
     @st.cache_data
     def champion_baseline(df_all: pd.DataFrame) -> pd.DataFrame:
-        if "champion" not in df_all.columns: 
+        if "champion" not in df_all.columns:
             return pd.DataFrame(columns=["champion","games","wins","winrate"])
         g = (df_all.groupby("champion", as_index=False)
                     .agg(games=("win_clean","count"), wins=("win_clean","sum")))
@@ -295,14 +304,12 @@ with st.container():
     base_tbl = champion_baseline(df)
     base_map = dict(zip(base_tbl["champion"], base_tbl["winrate"]))
 
-    # 2) 입력 — 텍스트 박스 & API 키(직접 입력)
     raw = st.text_area(
         "챔피언 10명 입력 (예: Lux Ziggs Sona Seraphine Ashe, Darius Garen Katarina Yasuo Aatrox)",
         placeholder="Lux Ziggs Sona Seraphine Ashe, Darius Garen Katarina Yasuo Aatrox"
     )
     api_key = st.text_input("OpenAI API 키 (선택: 전략 생성용)", type="password", placeholder="sk-...")
 
-    # 3) 계산 & 출력 (같은 패널)
     def avg_winrate(lst):
         vals = [base_map.get(x, None) for x in lst]
         known = [v for v in vals if v is not None]
