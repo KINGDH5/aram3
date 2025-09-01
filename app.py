@@ -154,7 +154,8 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
         stacks.append(dsel[[c, "win_clean"]].rename(columns={c: "item"}))
     union = pd.concat(stacks, ignore_index=True)
     union = union[union["item"].astype(str).str.strip() != ""]
-    union = union[union["item"] != "0"]  # 안전망
+    union = union[~union["item"].isin(["", "0", "포로 간식"])]
+
 
     top_items = (
         union.groupby("item")
