@@ -153,28 +153,33 @@ if games and any(re.fullmatch(r"item[0-6]_name", c) for c in dsel.columns):
     for c in [c for c in dsel.columns if re.fullmatch(r"item[0-6]_name", c)]:
         stacks.append(dsel[[c, "win_clean"]].rename(columns={c: "item"}))
     union = pd.concat(stacks, ignore_index=True)
-    union = union[union["item"].astype(str).str.strip() != ""]
-   union = union[~union["item"].isin(["", "0", "포로 간식"])]
+    union["item"] = union["item"].astype(str).str.strip()
+    union = union[~union["item"].isin(["", "0", "포로 간식"])]   # ← 여기 들여쓰기 맞춤
 
     top_items = (
-        union.groupby("item")
-        .agg(total_picks=("item","count"), wins=("win_clean","sum"))
-        .reset_index()
+        union.groupby("item", as_index=False)
+             .agg(total_picks=("item","count"), wins=("win_clean","sum"))
     )
     top_items["win_rate"] = (top_items["wins"]/top_items["total_picks"]*100).round(2)
     top_items["icon_url"] = top_items["item"].map(ITEM_ICON_MAP)
-    top_items = top_items.sort_values(["total_picks","win_rate"], ascending=[False, False]).head(20)
+    top_items = top_items.sort_values(
+        ["total_picks","win_rate"], ascending=[False, False]
+    ).head(20)
 
     st.dataframe(
         top_items[["icon_url","item","total_picks","wins","win_rate"]],
         use_container_width=True,
         column_config={
             "icon_url": st.column_config.ImageColumn("아이콘", width="small"),
-            "item": "아이템", "total_picks": "픽수", "wins": "승수", "win_rate": "승률(%)"
+            "item": "아이템",
+            "total_picks": "픽수",
+            "wins": "승수",
+            "win_rate": "승률(%)"
         }
     )
 else:
     st.info("아이템 이름 컬럼(item0_name~item6_name)이 없어 챔피언별 아이템 집계를 만들 수 없습니다.")
+
 
 # ===== 스펠 추천 (무순서 집계) =====
 st.subheader("Recommended Spell Combos (순서 무시)")
